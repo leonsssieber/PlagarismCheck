@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildReport, compareDocs, prepare } from "../lib/compare.ts";
+import { assembleReport, buildReport, compareDocs, findBibliography, findPhrases, matchSources, prepare, sourceMentioned } from "../lib/compare.ts";
 import { buildQueries } from "../lib/queries.ts";
 import { findQuotedRanges } from "../lib/text.ts";
 
@@ -60,4 +60,47 @@ test("queries are generated", () => {
 test("quote detection", () => {
   const r = findQuotedRanges('Er sagte „Hallo Welt“ und dann "noch etwas".');
   assert.equal(r.length, 2);
+});
+
+test("user adjustments change the report without re-matching", () => {
+  const copied = "Die Photosynthese ist der wichtigste Prozess der Primärproduktion auf der Erde und liefert den Sauerstoff der Atmosphäre.";
+  const text = `Das ist ein komplett eigener Satz über ganz andere Dinge wie Fahrräder und Brot. ${copied}`;
+  const doc = prepare(text);
+  const matched = matchSources(doc, [{ id: "a", url: "https://de.wikipedia.org/wiki/Photosynthese", title: "Photosynthese – Wikipedia", text: SOURCE, kind: "wikipedia" }]);
+  const base = assembleReport(doc, matched);
+  assert.ok(base.percent > 40);
+
+  const ignoredSrc = assembleReport(doc, matched, { ignoredSources: ["a"] });
+  assert.equal(ignoredSrc.percent, 0);
+  assert.equal(ignoredSrc.ignoredSources.length, 1);
+
+  const start = text.indexOf(copied);
+  const ignoredRange = assembleReport(doc, matched, { ignoredRanges: [[start, text.length]] });
+  assert.equal(ignoredRange.percent, 0);
+
+  const cited = assembleReport(doc, matched, { citedSources: ["a"] });
+  assert.equal(cited.percent, 0);
+  assert.ok(cited.citedWords > 10);
+  assert.ok(cited.sources[0].cited);
+
+  const excluded = assembleReport(doc, matched, { excludedRanges: [[start, text.length]] });
+  assert.equal(excluded.percent, 0);
+  assert.ok(excluded.excludedWords > 10);
+  assert.ok(excluded.segments.some((s) => s.kind === "excluded"));
+});
+
+test("bibliography detection and phrases", () => {
+  const body = "Dies ist der Hauptteil der Arbeit. ".repeat(20);
+  const text = `Inhaltsverzeichnis\n1. Einleitung\n\n${body}\n\nLiteraturverzeichnis\nMüller, A. (2020): Ein Buch. Berlin.`;
+  const bib = findBibliography(text);
+  assert.ok(bib);
+  assert.ok(text.slice(bib![0]).startsWith("Literaturverzeichnis"));
+  assert.equal(findBibliography(body), null);
+  assert.equal(findPhrases("Aufgabe: Erkläre X. Aufgabe: Erkläre Y.", ["aufgabe:"]).length, 2);
+});
+
+test("source mentioned in bibliography", () => {
+  const src = { id: "x", url: "https://www.example-lexikon.de/artikel/photosynthese", title: "Photosynthese erklärt", text: "", kind: "web" as const };
+  assert.ok(sourceMentioned("Quellen: https://example-lexikon.de/artikel/photosynthese (abgerufen 2024)", src));
+  assert.ok(!sourceMentioned("Quellen: Müller 2020", src));
 });

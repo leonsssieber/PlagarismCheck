@@ -22,7 +22,17 @@ zeigt im Bericht genau an, **welche Stellen** woher stammen könnten.
 - **Bericht:** Gesamtprozentsatz, Anteil pro Quelle, farbige Markierungen im Text (eine Farbe pro Quelle),
   Klick auf eine Markierung zeigt deinen Text und die Quelle nebeneinander mit hervorgehobenen
   Übereinstimmungen, Link zur Quelle, Blättern durch alle Stellen einer Quelle, Druck/PDF-Export.
-- **Einstellungen:** Prüftiefe (Schnell/Standard/Gründlich), Empfindlichkeit, Domains ausschließen.
+- **Ignorieren (vor der Prüfung):** Literaturverzeichnis wird automatisch erkannt und nicht geprüft;
+  eigene Textstellen/Phrasen (z. B. Aufgabenstellung) können ausgeschlossen werden; Domains ausschließen.
+- **Ignorieren (im Bericht):** einzelne Stellen ignorieren oder als Zitat werten, ganze Quellen ignorieren
+  oder als „korrekt zitiert“ werten – die Prozentwerte werden sofort neu berechnet, alles ist rückgängig machbar.
+- **Synopse:** dein Text und die komplette Quelle nebeneinander, Klick auf eine Markierung springt zur
+  Gegenstelle.
+- **Verteilungsbalken** zeigt, wo im Dokument die Übereinstimmungen liegen; Filter nach Art der Übereinstimmung.
+- **Quellenangabe erkannt:** Wird eine Quelle (Domain, DOI oder Titel) im Text bzw. Literaturverzeichnis genannt,
+  wird sie mit „im Text/Literaturverzeichnis genannt“ gekennzeichnet.
+- **Verlauf:** die letzten 25 Prüfungen inkl. deiner Anpassungen – nur lokal im Browser gespeichert.
+- **Einstellungen:** Prüftiefe (Schnell/Standard/Gründlich) und Empfindlichkeit.
 - **Datenschutz:** Keine Datenbank, keine Anmeldung. Der Vergleich läuft im Browser; an den Server gehen nur
   die Suchanfragen (kurze Wortfolgen) und die URLs der zu ladenden Quellen.
 

@@ -18,7 +18,7 @@ interface Candidate {
   pos: number;
 }
 
-export function buildQueries(doc: PreparedDoc, maxQueries: number): string[] {
+export function buildQueries(doc: PreparedDoc, maxQueries: number, skip?: Uint8Array): string[] {
   const cands: Candidate[] = [];
   const toks = doc.tokens;
 
@@ -43,6 +43,7 @@ export function buildQueries(doc: PreparedDoc, maxQueries: number): string[] {
   };
 
   for (const s of doc.sentences) {
+    if (skip && (skip[s.t0] || skip[s.t1 - 1])) continue;
     const len = s.t1 - s.t0;
     if (len < 7) continue;
     if (len <= WINDOW + 4) {
@@ -55,7 +56,7 @@ export function buildQueries(doc: PreparedDoc, maxQueries: number): string[] {
     }
   }
 
-  if (cands.length === 0 && toks.length >= 6) {
+  if (cands.length === 0 && toks.length >= 6 && !skip?.some((x) => x)) {
     for (let a = 0; a < toks.length; a += 25) addWindow(a, Math.min(toks.length, a + 25));
   }
 

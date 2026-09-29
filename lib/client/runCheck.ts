@@ -1,7 +1,7 @@
 // Orchestrates a plagiarism check in the browser: query generation, search,
 // source retrieval (through the server API routes) and the local comparison.
 
-import { buildReport, prepare, type Report, type ReportOptions, type SourceDoc } from "../compare.ts";
+import { findBibliography, findPhrases, matchSources, prepare, type MatchedSource, type Range, type ReportOptions, type SourceDoc } from "../compare.ts";
 import { buildQueries, DEPTH_SETTINGS, type Depth } from "../queries.ts";
 import { detectLanguage } from "../text.ts";
 
@@ -15,6 +15,10 @@ export interface CheckSettings {
   excludeQuotes: boolean;
   sensitivity: Sensitivity;
   excludeDomains: string[];
+  /** do not check the bibliography */
+  ignoreBibliography: boolean;
+  /** phrases / passages that are not checked (one per entry) */
+  ignorePhrases: string[];
   references: SourceDoc[];
 }
 
@@ -34,10 +38,16 @@ export interface CheckStats {
 }
 
 export interface CheckResult {
-  report: Report;
-  stats: CheckStats;
-  text: string;
+  id: string;
   date: string;
+  text: string;
+  matched: MatchedSource[];
+  /** parts of the text that were not checked */
+  excludedRanges: Range[];
+  bibliography: Range | null;
+  excludeQuotes: boolean;
+  stats: CheckStats;
+  settings: { depth: Depth; sensitivity: Sensitivity };
 }
 
 interface Hit {
@@ -109,6 +119,10 @@ export async function runCheck(
   signal?: AbortSignal,
 ): Promise<CheckResult> {
   const doc = prepare(text);
+  const bibliography = settings.ignoreBibliography ? findBibliography(text) : null;
+  const excludedRanges: Range[] = [...(bibliography ? [bibliography] : []), ...findPhrases(text, settings.ignorePhrases)];
+  const skip = new Uint8Array(doc.tokens.length);
+  for (const [a, b] of excludedRanges) doc.tokens.forEach((t, i) => { if (t.s >= a && t.e <= b) skip[i] = 1; });
   const lang = detectLanguage(doc.tokens);
   const depth = DEPTH_SETTINGS[settings.depth];
   const stats: CheckStats = { queries: 0, candidates: 0, fetched: 0, failed: 0, searchErrors: [], webHits: 0 };
@@ -118,7 +132,7 @@ export async function runCheck(
   const anyOnline = settings.web || settings.wikipedia || settings.academic;
   if (anyOnline) {
     // ---------------- search ----------------
-    const queries = buildQueries(doc, depth.queries);
+    const queries = buildQueries(doc, depth.queries, skip);
     stats.queries = queries.length;
     const batches: string[][] = [];
     for (let i = 0; i < queries.length; i += 4) batches.push(queries.slice(i, i + 4));
@@ -248,12 +262,17 @@ export async function runCheck(
 
   onProgress({ phase: "compare", percent: 92, message: "Vergleiche Text mit den Quellen…" });
   await new Promise((r) => setTimeout(r, 30));
-  const report = buildReport(
-    text,
-    sources,
-    { ...SENSITIVITY[settings.sensitivity], excludeQuotes: settings.excludeQuotes },
-    doc,
-  );
+  const matched = matchSources(doc, sources, SENSITIVITY[settings.sensitivity]);
   onProgress({ phase: "done", percent: 100, message: "Fertig" });
-  return { report, stats, text, date: new Date().toISOString() };
+  return {
+    id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    date: new Date().toISOString(),
+    text,
+    matched,
+    excludedRanges,
+    bibliography,
+    excludeQuotes: settings.excludeQuotes,
+    stats,
+    settings: { depth: settings.depth, sensitivity: settings.sensitivity },
+  };
 }

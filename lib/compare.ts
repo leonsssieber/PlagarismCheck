@@ -279,18 +279,51 @@ export function compareDocs(doc: PreparedDoc, src: PreparedDoc, opts: CompareOpt
 // Aggregation / report
 // ---------------------------------------------------------------------------
 
+/** A source together with its matches against the checked text. */
+export interface MatchedSource {
+  source: SourceDoc;
+  matches: Match[];
+  /** stable colour index (order of discovery by size) */
+  color: number;
+}
+
+export type Range = [number, number];
+
+/** User decisions that change the report without re-running the comparison. */
+export interface Adjustments {
+  /** do not count text in quotation marks as plagiarism (default true) */
+  excludeQuotes?: boolean;
+  /** character ranges that are not checked at all (bibliography, ignored phrases) */
+  excludedRanges?: Range[];
+  /** character ranges the user marked as harmless */
+  ignoredRanges?: Range[];
+  /** character ranges the user marked as correctly cited */
+  citedRanges?: Range[];
+  /** source ids removed from the report */
+  ignoredSources?: string[];
+  /** source ids whose matches count as correctly cited */
+  citedSources?: string[];
+}
+
 export interface SourceReport {
   source: SourceDoc;
   matches: Match[];
+  color: number;
   /** words of the checked text matched by this source (non-exclusive) */
   words: number;
   /** words attributed to this source in the final report */
   exclusiveWords: number;
+  /** words attributed to this source but counted as citation */
+  citedWords: number;
   percent: number;
   exclusivePercent: number;
+  /** the user marked this source as correctly cited */
+  cited: boolean;
+  /** the source (domain, DOI or title) is mentioned in the checked text, e.g. in the bibliography */
+  mentioned: boolean;
 }
 
-export type SegmentKind = "exact" | "near" | "paraphrase" | "citation";
+export type SegmentKind = "exact" | "near" | "paraphrase" | "citation" | "excluded";
 
 export interface TextSegment {
   start: number;
@@ -301,71 +334,138 @@ export interface TextSegment {
 }
 
 export interface Report {
+  /** words that were checked (without excluded parts) */
   totalWords: number;
+  excludedWords: number;
   plagWords: number;
   paraphraseWords: number;
   citedWords: number;
   percent: number;
   sources: SourceReport[];
+  ignoredSources: MatchedSource[];
   segments: TextSegment[];
   flaggedSentences: number;
   totalSentences: number;
 }
 
 export interface ReportOptions extends CompareOptions {
-  /** do not count text in quotation marks as plagiarism */
   excludeQuotes?: boolean;
 }
 
-export function buildReport(
-  text: string,
-  sources: SourceDoc[],
-  opts: ReportOptions = {},
-  preparedDoc?: PreparedDoc,
-): Report {
-  const doc = preparedDoc ?? prepare(text);
-  const n = doc.tokens.length;
-
-  const raw: SourceReport[] = [];
+/** Runs the (expensive) comparison of the text against all sources. */
+export function matchSources(doc: PreparedDoc, sources: SourceDoc[], opts: CompareOptions = {}): MatchedSource[] {
+  const out: { source: SourceDoc; matches: Match[]; words: number }[] = [];
+  const seen = new Set<string>();
   for (const source of sources) {
-    const src = prepare(source.text);
-    const matches = compareDocs(doc, src, opts);
+    if (seen.has(source.id)) continue;
+    seen.add(source.id);
+    const matches = compareDocs(doc, prepare(source.text), opts);
     if (!matches.length) continue;
-    const mark = new Uint8Array(n);
+    const mark = new Uint8Array(doc.tokens.length);
     for (const m of matches) for (let t = m.t0; t < m.t1; t++) mark[t] = 1;
     let words = 0;
-    for (let t = 0; t < n; t++) words += mark[t];
-    raw.push({ source, matches, words, exclusiveWords: 0, percent: 0, exclusivePercent: 0 });
+    for (const x of mark) words += x;
+    out.push({ source, matches, words });
   }
+  out.sort((a, b) => b.words - a.words);
+  return out.map((x, color) => ({ source: x.source, matches: x.matches, color }));
+}
 
-  // Drop duplicate sources (e.g. mirrors) which cover exactly the same words
-  raw.sort((a, b) => b.words - a.words);
-
-  // Quote detection
-  const quoted = new Uint8Array(n);
-  if (opts.excludeQuotes !== false) {
-    const ranges = findQuotedRanges(text);
-    let r = 0;
-    for (let t = 0; t < n; t++) {
-      while (r < ranges.length && ranges[r][1] <= doc.tokens[t].s) r++;
-      if (r < ranges.length && ranges[r][0] <= doc.tokens[t].s && doc.tokens[t].e <= ranges[r][1]) quoted[t] = 1;
+function rangeMask(doc: PreparedDoc, ranges: Range[] | undefined): Uint8Array {
+  const mask = new Uint8Array(doc.tokens.length);
+  if (!ranges?.length) return mask;
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
+  let r = 0;
+  for (let t = 0; t < doc.tokens.length; t++) {
+    const tok = doc.tokens[t];
+    while (r < sorted.length && sorted[r][1] <= tok.s) r++;
+    for (let k = r; k < sorted.length && sorted[k][0] < tok.e; k++) {
+      if (sorted[k][1] > tok.s) {
+        mask[t] = 1;
+        break;
+      }
     }
   }
+  return mask;
+}
 
-  // Attribution: verbatim matches first (largest sources first), then paraphrases.
+function normalizeLoose(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .replace(/[^\p{L}\p{N}.\/]+/gu, " ")
+    .trim();
+}
+
+/** Does the checked text mention the source (URL, domain, DOI or title)? */
+export function sourceMentioned(text: string, source: SourceDoc): boolean {
+  if (!source.url) return false;
+  const lower = text.toLowerCase();
+  try {
+    const u = new URL(source.url);
+    const host = u.hostname.replace(/^www\./, "").toLowerCase();
+    if (host === "doi.org" || host.endsWith(".doi.org")) {
+      const doi = decodeURIComponent(u.pathname.slice(1)).toLowerCase();
+      if (doi && lower.includes(doi)) return true;
+    } else if (/wikipedia\.org$/.test(host)) {
+      const article = decodeURIComponent(u.pathname.replace(/^\/wiki\//, "")).replace(/_/g, " ").toLowerCase();
+      if (lower.includes("wikipedia") && article && lower.includes(article)) return true;
+    } else if (lower.includes(host)) {
+      return true;
+    }
+  } catch {
+    /* ignore */
+  }
+  const title = normalizeLoose(source.title.replace(/\s[–|-]\s.*$/, "").replace(/\(\d{4}\)\s*$/, ""));
+  if (title.length >= 20) {
+    const head = title.split(" ").slice(0, 8).join(" ");
+    if (head.length >= 20 && normalizeLoose(text).includes(head)) return true;
+  }
+  return false;
+}
+
+/** Builds the report from pre-computed matches and the user's adjustments (cheap). */
+export function assembleReport(doc: PreparedDoc, matched: MatchedSource[], adj: Adjustments = {}): Report {
+  const text = doc.text;
+  const n = doc.tokens.length;
+  const ignoredIds = new Set(adj.ignoredSources ?? []);
+  const citedIds = new Set(adj.citedSources ?? []);
+  const active = matched.filter((m) => !ignoredIds.has(m.source.id));
+  const ignoredSources = matched.filter((m) => ignoredIds.has(m.source.id));
+
+  const excluded = rangeMask(doc, adj.excludedRanges);
+  const ignored = rangeMask(doc, adj.ignoredRanges);
+  const cited = rangeMask(doc, adj.citedRanges);
+  if (adj.excludeQuotes !== false) {
+    const q = rangeMask(doc, findQuotedRanges(text));
+    for (let t = 0; t < n; t++) if (q[t]) cited[t] = 1;
+  }
+
+  // Order: largest sources first (by non-exclusive coverage of checked words)
+  const stats = active.map((ms) => {
+    const mark = new Uint8Array(n);
+    for (const m of ms.matches) for (let t = m.t0; t < m.t1; t++) if (!excluded[t] && !ignored[t]) mark[t] = 1;
+    let words = 0;
+    for (const x of mark) words += x;
+    return { ms, words, exclusiveWords: 0, citedWords: 0 };
+  });
+  stats.sort((a, b) => b.words - a.words);
+
   const ownerSrc = new Int32Array(n).fill(-1);
   const ownerMatch = new Int32Array(n).fill(-1);
   const ownerKind: (SegmentKind | undefined)[] = new Array(n);
   const passes: Array<(m: Match) => boolean> = [(m) => m.type !== "paraphrase", (m) => m.type === "paraphrase"];
   for (const pass of passes) {
-    raw.forEach((sr, si) => {
-      sr.matches.forEach((m, mi) => {
+    stats.forEach((st, si) => {
+      const srcCited = citedIds.has(st.ms.source.id);
+      st.ms.matches.forEach((m, mi) => {
         if (!pass(m)) return;
         for (let t = m.t0; t < m.t1; t++) {
-          if (ownerSrc[t] !== -1) continue;
+          if (ownerSrc[t] !== -1 || excluded[t] || ignored[t]) continue;
           ownerSrc[t] = si;
           ownerMatch[t] = mi;
-          ownerKind[t] = quoted[t] ? "citation" : m.type;
+          ownerKind[t] = cited[t] || srcCited ? "citation" : m.type;
         }
       });
     });
@@ -374,69 +474,148 @@ export function buildReport(
   let plagWords = 0;
   let paraphraseWords = 0;
   let citedWords = 0;
+  let excludedWords = 0;
   for (let t = 0; t < n; t++) {
+    if (excluded[t]) {
+      excludedWords++;
+      continue;
+    }
     const k = ownerKind[t];
     if (!k) continue;
-    if (k === "citation") citedWords++;
-    else {
+    if (k === "citation") {
+      citedWords++;
+      stats[ownerSrc[t]].citedWords++;
+    } else {
       plagWords++;
       if (k === "paraphrase") paraphraseWords++;
-      raw[ownerSrc[t]].exclusiveWords++;
+      stats[ownerSrc[t]].exclusiveWords++;
     }
   }
+  const total = n - excludedWords;
 
-  // Keep only sources that still contribute something, re-index.
-  const keep = raw
-    .map((sr, idx) => ({ sr, idx }))
-    .filter(({ sr }) => sr.exclusiveWords > 0 || sr.words >= 15);
-  keep.sort((a, b) => b.sr.exclusiveWords - a.sr.exclusiveWords || b.sr.words - a.sr.words);
+  const keep = stats
+    .map((st, idx) => ({ st, idx }))
+    .filter(({ st }) => st.exclusiveWords > 0 || st.citedWords > 0 || st.words >= 15);
+  keep.sort((a, b) => b.st.exclusiveWords - a.st.exclusiveWords || b.st.citedWords - a.st.citedWords || b.st.words - a.st.words);
   const remap = new Map<number, number>();
   keep.forEach(({ idx }, newIdx) => remap.set(idx, newIdx));
-  const sourcesOut = keep.map(({ sr }) => ({
-    ...sr,
-    percent: n ? (sr.words / n) * 100 : 0,
-    exclusivePercent: n ? (sr.exclusiveWords / n) * 100 : 0,
+  const sources: SourceReport[] = keep.map(({ st }) => ({
+    source: st.ms.source,
+    matches: st.ms.matches,
+    color: st.ms.color,
+    words: st.words,
+    exclusiveWords: st.exclusiveWords,
+    citedWords: st.citedWords,
+    percent: total ? (st.words / total) * 100 : 0,
+    exclusivePercent: total ? (st.exclusiveWords / total) * 100 : 0,
+    cited: citedIds.has(st.ms.source.id),
+    mentioned: sourceMentioned(text, st.ms.source),
   }));
 
-  // Build text segments for rendering
+  // Segments for rendering
   const segments: TextSegment[] = [];
   let pos = 0;
   let t = 0;
   while (t < n) {
     const si = ownerSrc[t];
-    if (si === -1 || !remap.has(si)) {
+    const isExcl = excluded[t] === 1;
+    if (!isExcl && (si === -1 || !remap.has(si))) {
       t++;
       continue;
     }
-    const mi = ownerMatch[t];
-    const kind = ownerKind[t];
     let u = t;
-    while (u + 1 < n && ownerSrc[u + 1] === si && ownerMatch[u + 1] === mi && ownerKind[u + 1] === kind) u++;
+    if (isExcl) {
+      while (u + 1 < n && excluded[u + 1]) u++;
+    } else {
+      const mi = ownerMatch[t];
+      const kind = ownerKind[t];
+      while (u + 1 < n && ownerSrc[u + 1] === si && ownerMatch[u + 1] === mi && ownerKind[u + 1] === kind) u++;
+    }
     const start = doc.tokens[t].s;
     const end = doc.tokens[u].e;
     if (start > pos) segments.push({ start: pos, end: start });
-    segments.push({ start, end, kind, sourceIdx: remap.get(si), matchIdx: mi });
+    if (isExcl) segments.push({ start, end, kind: "excluded" });
+    else segments.push({ start, end, kind: ownerKind[t], sourceIdx: remap.get(si), matchIdx: ownerMatch[t] });
     pos = end;
     t = u + 1;
   }
   if (pos < text.length) segments.push({ start: pos, end: text.length });
 
   let flaggedSentences = 0;
+  let totalSentences = 0;
   for (const s of doc.sentences) {
     let c = 0;
-    for (let x = s.t0; x < s.t1; x++) if (ownerKind[x] && ownerKind[x] !== "citation") c++;
-    if (c / Math.max(1, s.t1 - s.t0) >= 0.5) flaggedSentences++;
+    let checked = 0;
+    for (let x = s.t0; x < s.t1; x++) {
+      if (excluded[x]) continue;
+      checked++;
+      if (ownerKind[x] && ownerKind[x] !== "citation" && remap.has(ownerSrc[x])) c++;
+    }
+    if (!checked) continue;
+    totalSentences++;
+    if (c / checked >= 0.5) flaggedSentences++;
   }
 
   return {
-    totalWords: n,
+    totalWords: total,
+    excludedWords,
     plagWords,
     paraphraseWords,
     citedWords,
-    percent: n ? (plagWords / n) * 100 : 0,
-    sources: sourcesOut,
+    percent: total ? (plagWords / total) * 100 : 0,
+    sources,
+    ignoredSources,
     segments,
     flaggedSentences,
-    totalSentences: doc.sentences.length,
+    totalSentences,
   };
+}
+
+/** Convenience: compare and assemble in one step. */
+export function buildReport(
+  text: string,
+  sources: SourceDoc[],
+  opts: ReportOptions = {},
+  preparedDoc?: PreparedDoc,
+  adj: Adjustments = {},
+): Report {
+  const doc = preparedDoc ?? prepare(text);
+  return assembleReport(doc, matchSources(doc, sources, opts), { excludeQuotes: opts.excludeQuotes, ...adj });
+}
+
+// ---------------------------------------------------------------------------
+// Parts of the text that should not be checked
+// ---------------------------------------------------------------------------
+
+const BIBLIO_RE =
+  /^[ \t]*(?:\d+(?:\.\d+)*\.?[ \t]+)?(?:literaturverzeichnis|literatur|quellenverzeichnis|quellen|quellenangaben|internetquellen|bibliographie|bibliografie|references|reference list|bibliography|works cited|sources)[ \t]*:?[ \t]*$/gim;
+
+/** Finds the bibliography (from its heading to the end of the text). */
+export function findBibliography(text: string): Range | null {
+  let found: Range | null = null;
+  for (const m of text.matchAll(BIBLIO_RE)) {
+    const idx = m.index ?? 0;
+    // Only headings in the second half of the text (not a table of contents entry)
+    if (idx >= text.length * 0.4) {
+      found = [idx, text.length];
+      break;
+    }
+  }
+  return found;
+}
+
+/** Finds all occurrences of the given phrases (case-insensitive). */
+export function findPhrases(text: string, phrases: string[]): Range[] {
+  const out: Range[] = [];
+  const lower = text.toLowerCase();
+  for (const raw of phrases) {
+    const p = raw.trim().toLowerCase();
+    if (p.length < 3) continue;
+    let i = 0;
+    while ((i = lower.indexOf(p, i)) !== -1) {
+      out.push([i, i + p.length]);
+      i += p.length;
+    }
+  }
+  return out;
 }

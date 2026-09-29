@@ -5,7 +5,8 @@ import ReportView from "@/components/ReportView";
 import { ACCEPTED_FILES, fileToText } from "@/lib/client/files";
 import { runCheck, type CheckProgress, type CheckResult, type CheckSettings, type Sensitivity } from "@/lib/client/runCheck";
 import { DEPTH_SETTINGS, type Depth } from "@/lib/queries";
-import type { SourceDoc } from "@/lib/compare";
+import { findBibliography, type SourceDoc } from "@/lib/compare";
+import { EMPTY_ADJUSTMENTS, deleteEntry, listHistory, loadEntry, saveEntry, type HistorySummary, type UserAdjustments } from "@/lib/client/history";
 import { wordCount } from "@/lib/text";
 
 const MIN_WORDS = 30;
@@ -22,6 +23,8 @@ const DEFAULT_SETTINGS: Stored = {
   excludeQuotes: true,
   sensitivity: "normal",
   excludeDomains: [],
+  ignoreBibliography: true,
+  ignorePhrases: [],
 };
 
 export default function Home() {
@@ -30,6 +33,8 @@ export default function Home() {
   const [references, setReferences] = useState<SourceDoc[]>([]);
   const [progress, setProgress] = useState<CheckProgress | null>(null);
   const [result, setResult] = useState<CheckResult | null>(null);
+  const [adjustments, setAdjustments] = useState<UserAdjustments>(EMPTY_ADJUSTMENTS);
+  const [history, setHistory] = useState<HistorySummary[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loadingFile, setLoadingFile] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -45,6 +50,7 @@ export default function Home() {
     } catch {
       /* ignore */
     }
+    listHistory().then(setHistory);
     fetch("/api/status")
       .then((r) => r.json())
       .then((d) => setWebProviders(d.webProviders ?? []))
@@ -111,6 +117,7 @@ export default function Home() {
     setProgress({ phase: "search", percent: 0, message: "Starte Prüfung…" });
     try {
       const res = await runCheck(text, { ...settings, references }, setProgress, ctrl.signal);
+      setAdjustments(EMPTY_ADJUSTMENTS);
       setResult(res);
       window.scrollTo({ top: 0 });
     } catch (e) {
@@ -120,6 +127,25 @@ export default function Home() {
       abortRef.current = null;
     }
   }
+
+  async function openHistory(id: string) {
+    const entry = await loadEntry(id);
+    if (!entry) {
+      setError("Diese Prüfung konnte nicht geladen werden.");
+      return;
+    }
+    setText(entry.result.text);
+    setAdjustments(entry.adjustments);
+    setResult(entry.result);
+    window.scrollTo({ top: 0 });
+  }
+
+  async function removeHistory(id: string) {
+    await deleteEntry(id);
+    setHistory(await listHistory());
+  }
+
+  const bibliography = settings.ignoreBibliography && text ? findBibliography(text) : null;
 
   const webLabel =
     webProviders === null
@@ -145,7 +171,21 @@ export default function Home() {
         <div className="container">
           {result ? (
             <ReportView
+              key={result.id}
               result={result}
+              adjustments={adjustments}
+              onAdjustmentsChange={(adj, report) => {
+                const r = result;
+                saveEntry({
+                  id: r.id,
+                  date: r.date,
+                  title: r.text.trim().split(/\s+/).slice(0, 12).join(" "),
+                  words: report.totalWords,
+                  percent: report.percent,
+                  result: r,
+                  adjustments: adj,
+                }).then(() => listHistory().then(setHistory));
+              }}
               onNew={() => {
                 setResult(null);
                 setText("");
@@ -321,6 +361,39 @@ export default function Home() {
                   </div>
 
                   <div>
+                    <span className="field-label">Ignorieren</span>
+                    <label className="check">
+                      <input
+                        type="checkbox"
+                        checked={settings.ignoreBibliography}
+                        onChange={(e) => update({ ignoreBibliography: e.target.checked })}
+                      />
+                      <span>
+                        Literaturverzeichnis nicht prüfen
+                        <small>
+                          {!text
+                            ? "wird automatisch erkannt (Überschrift „Literatur“, „Quellen“ …)"
+                            : bibliography
+                              ? `erkannt: ${text.slice(bibliography[0], bibliography[1]).trim().split(/\s+/).length} Wörter werden übersprungen`
+                              : "kein Literaturverzeichnis erkannt"}
+                        </small>
+                      </span>
+                    </label>
+                    <label className="field-label" htmlFor="phrases" style={{ marginTop: 10 }}>
+                      Textstellen / Phrasen ignorieren
+                    </label>
+                    <textarea
+                      id="phrases"
+                      className="text-input"
+                      rows={3}
+                      placeholder={"Eine pro Zeile, z. B. Aufgabenstellung,\nTitel oder Standardformulierungen"}
+                      defaultValue={settings.ignorePhrases.join("\n")}
+                      onBlur={(e) => update({ ignorePhrases: e.target.value.split("\n").map((x) => x.trim()).filter(Boolean) })}
+                    />
+                    <div className="help">Nach der Prüfung kannst du im Bericht außerdem einzelne Stellen oder ganze Quellen ignorieren.</div>
+                  </div>
+
+                  <div>
                     <label className="field-label" htmlFor="excl">
                       Domains ausschließen
                     </label>
@@ -341,6 +414,32 @@ export default function Home() {
                   )}
                 </aside>
               </div>
+
+              {history.length > 0 && (
+                <section className="panel history">
+                  <h2>Letzte Prüfungen</h2>
+                  <div className="help" style={{ marginTop: -8, marginBottom: 8 }}>Nur in diesem Browser gespeichert.</div>
+                  <ul>
+                    {history.map((h) => (
+                      <li key={h.id}>
+                        <button className="history-open" onClick={() => openHistory(h.id)}>
+                          <span className={`history-pct ${h.percent >= 30 ? "bad" : h.percent >= 15 ? "warn" : "good"}`}>
+                            {h.percent.toLocaleString("de-DE", { maximumFractionDigits: 1 })} %
+                          </span>
+                          <span className="history-title">{h.title}…</span>
+                          <span className="history-meta">
+                            {new Date(h.date).toLocaleString("de-DE", { dateStyle: "short", timeStyle: "short" })} ·{" "}
+                            {h.words.toLocaleString("de-DE")} Wörter
+                          </span>
+                        </button>
+                        <button className="link-btn" aria-label="Löschen" title="Löschen" onClick={() => removeHistory(h.id)}>
+                          ✕
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              )}
             </>
           )}
         </div>
